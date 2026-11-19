@@ -26,6 +26,24 @@ This system looks at every incoming message and automatically picks one of three
 
 ---
 
+## 🛠️ Built With & Key Highlights
+
+- **AI Model**: Google Gemini 2.5 Flash Lite (Multimodal understanding across text, images, and voice notes)
+- **Safety Engine**: 7 Deterministic Security Rules (absolute veto on scams, phishing, and fake banks)
+- **Language & Runtime**: Python 3.11+
+- **Pacing & Reliability**: Automatic rate-limit throttling and atomic per-row checkpoint resumption
+
+---
+
+## 🛠️ Built With & Key Highlights
+
+- **AI Model**: Google Gemini 2.5 Flash Lite (Multimodal understanding across text, images, and voice notes)
+- **Safety Engine**: 7 Deterministic Security Rules (Zero model calls; absolute veto on scams, phishing, and fake banks)
+- **Language & Runtime**: Python 3.11+
+- **Pacing & Reliability**: Automatic rate-limit throttling and atomic per-row checkpoint resumption
+
+---
+
 ## 🧠 How It Makes Decisions
 
 Instead of guessing, the AI checks three simple questions for each message:
@@ -98,7 +116,7 @@ Open your terminal and run:
 
 ```bash
 # 1. Clone this project
-git clone https://github.com/<your-username>/message-notification-router.git
+git clone https://github.com/MAHESHPPAI/message-notification-router.git
 cd message-notification-router
 
 # 2. Create a virtual environment
@@ -132,12 +150,13 @@ GEMINI_API_KEY=your-gemini-api-key-here
 
 ## 🏃 Running the Program
 
-### Process All Messages
-Run the main script to categorize all messages in the dataset:
+### Process All Messages (Recommended)
+Run the main script to categorize all 110 messages across the dataset:
 
 ```bash
-python code/main.py
+python code/main.py --workers 2 --resume
 ```
+> **Tip:** `--workers 2` paces requests to respect Gemini free-tier rate limits, while `--resume` saves atomic checkpoints so you can resume anytime without re-processing completed messages.
 
 ### Helpful Options
 
@@ -153,11 +172,11 @@ python code/main.py
   python code/main.py --limit 5
   ```
 
-- **Resume an interrupted run (`--resume`)**:
-  If your internet cuts out or you stop the script, this picks up right where you left off:
-  ```bash
-  python code/main.py --resume
-  ```
+### Verify Output Format
+Verify that all decisions follow the required schema and character limits:
+```bash
+python code/evaluation/validate_output.py --output dataset/output.csv
+```
 
 ---
 
