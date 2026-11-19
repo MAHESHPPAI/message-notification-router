@@ -53,7 +53,9 @@ from typing import Mapping, Sequence  # noqa: E402
 
 from agent.client import (  # noqa: E402
     OpenAIProvider,
+    Provider,
     ProviderClientError,
+    default_provider_resolver,
 )
 # The fence and its delimiter-defanging are a §9.7 control. Re-implementing them here would
 # create a second copy that can drift from the one the router uses; importing keeps one.
@@ -358,10 +360,10 @@ def score_rows(
     *,
     label: str,
     workers: int = MAX_CONCURRENCY,
-    provider: OpenAIProvider | None = None,
+    provider: Provider | None = None,
 ) -> JudgeReport:
     """Score ``(message_id, reason, action, message_type)`` rows concurrently."""
-    client = provider if provider is not None else OpenAIProvider()
+    client = provider if provider is not None else default_provider_resolver()(JUDGE_MODEL)
     cache = _load_cache()
 
     # One model call per distinct (reason, action, message_type). The labelled reasons are

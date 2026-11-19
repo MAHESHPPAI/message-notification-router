@@ -8,20 +8,27 @@ while retry counts and the model that answered are represented as typed metadata
 
 from __future__ import annotations
 
+import base64
+import copy
 import json
 import logging
 import random
+import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 from config import (
     ANTHROPIC_API_KEY,
     FALLBACK_CHAIN,
+    GEMINI_API_KEY,
     MAX_RETRY_ATTEMPTS,
     OPENAI_API_KEY,
     PER_ROW_TIMEOUT_SECONDS,
@@ -251,11 +258,11 @@ def _as_int(value: object) -> int | None:
 
 
 def _status_code(error: BaseException) -> int | None:
-    direct = _as_int(getattr(error, "status_code", None))
+    direct = _as_int(getattr(error, "status_code", None) or getattr(error, "code", None))
     if direct is not None:
         return direct
     response = getattr(error, "response", None)
-    return _as_int(getattr(response, "status_code", None))
+    return _as_int(getattr(response, "status_code", None) or getattr(response, "code", None))
 
 
 def _mapping_value(value: object, key: str) -> object | None:
@@ -979,6 +986,301 @@ class OpenAIProvider:
         return CompletionResult(result.value, result.attempts, result.retry_count)
 
 
+def _clean_schema_for_gemini(schema: object) -> object:
+    if not isinstance(schema, dict):
+        return schema
+    cleaned: dict[str, object] = {}
+    for k, v in schema.items():
+        if k == "additionalProperties":
+            continue
+        if k == "type" and isinstance(v, list):
+            non_null = [t for t in v if t != "null"]
+            cleaned["type"] = non_null[0] if non_null else "string"
+            if "null" in v:
+                cleaned["nullable"] = True
+        elif isinstance(v, dict):
+            cleaned[k] = _clean_schema_for_gemini(v)
+        elif isinstance(v, list):
+            cleaned[k] = [_clean_schema_for_gemini(item) for item in v]
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+_GEMINI_LOCK = threading.Lock()
+_GEMINI_LAST_CALL = 0.0
+
+
+def _throttle_gemini(min_interval: float = 2.5) -> None:
+    global _GEMINI_LAST_CALL
+    with _GEMINI_LOCK:
+        now = time.time()
+        elapsed = now - _GEMINI_LAST_CALL
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        _GEMINI_LAST_CALL = time.time()
+
+
+class GeminiProvider:
+    """Native Google Gemini API adapter supporting multimodal reasoning, function calling, and audio transcription."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        max_attempts: int = MAX_RETRY_ATTEMPTS,
+        retry_base: float = RETRY_BASE_SECONDS,
+        retry_cap: float = RETRY_CAP_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        random_source: Callable[[], float] = random.random,
+    ) -> None:
+        key = api_key or GEMINI_API_KEY
+        if not key:
+            raise AuthenticationProviderError(
+                "GEMINI_API_KEY is not configured",
+                attempts=0,
+                category="authentication",
+            )
+        self._api_key = key
+        self._max_attempts = max_attempts
+        self._retry_base = retry_base
+        self._retry_cap = retry_cap
+        self._sleep = sleep
+        self._random = random_source
+
+    def supports_vision(self) -> bool:
+        return True
+
+    def supports_audio(self) -> bool:
+        return True
+
+    def transcribe(self, audio_path: str | Path, model: str) -> CompletionResult:
+        path = Path(audio_path)
+        with path.open("rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+        ext = path.suffix.lower()
+        mime = "audio/ogg" if ext in (".ogg", ".oga") else ("audio/mp3" if ext in (".mp3", ".mpeg") else "audio/wav")
+
+        def request() -> object:
+            _throttle_gemini()
+            m = model if model.startswith("gemini") else "gemini-2.5-flash"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={self._api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": mime, "data": audio_b64}},
+                        {"text": "Transcribe this audio recording exactly as spoken. Return only the transcript text."}
+                    ]
+                }]
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=PER_ROW_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts)
+                return SimpleNamespace(text=text.strip())
+
+        result = retry_with_backoff(
+            request,
+            self._max_attempts,
+            self._retry_base,
+            self._retry_cap,
+            _sleep=self._sleep,
+            _random=self._random,
+        )
+        return CompletionResult(result.value, result.attempts, result.retry_count)
+
+    def batch_tool_results(
+        self, results: Sequence[Mapping[str, object] | object]
+    ) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for result in results:
+            identifier, content, is_error = _tool_result_parts(result)
+            items.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": identifier,
+                    "content": _json_text(content),
+                    "is_error": is_error,
+                }
+            )
+        return [{"role": "user", "content": items}]
+
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, object]],
+        tools: Sequence[Mapping[str, object]],
+        model: str,
+        **kw: object,
+    ) -> CompletionResult:
+        m = model if model.startswith("gemini") else "gemini-2.5-flash"
+
+        def request() -> object:
+            _throttle_gemini()
+            system_instruction = None
+            contents = []
+
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+
+                if role == "system":
+                    sys_text = ""
+                    if isinstance(content, str):
+                        sys_text = content
+                    elif isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                sys_text += str(b.get("text", ""))
+                    system_instruction = {"parts": [{"text": sys_text}]}
+                    continue
+
+                parts = []
+                if isinstance(content, str):
+                    parts.append({"text": content})
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict):
+                            b_type = b.get("type")
+                            if b_type == "text":
+                                parts.append({"text": str(b.get("text", ""))})
+                            elif b_type == "image":
+                                src = b.get("source", {})
+                                parts.append({
+                                    "inline_data": {
+                                        "mime_type": src.get("media_type", "image/jpeg"),
+                                        "data": src.get("data", ""),
+                                    }
+                                })
+                            elif b_type == "tool_use":
+                                parts.append({
+                                    "functionCall": {
+                                        "name": b.get("name"),
+                                        "args": b.get("input", {}),
+                                    }
+                                })
+                            elif b_type == "tool_result":
+                                parts.append({
+                                    "text": f"Tool result: {b.get('content', '')}"
+                                })
+                        else:
+                            parts.append({"text": str(b)})
+
+                if parts:
+                    gemini_role = "model" if role == "assistant" else "user"
+                    contents.append({"role": gemini_role, "parts": parts})
+
+            payload: dict[str, Any] = {"contents": contents}
+            if system_instruction:
+                payload["system_instruction"] = system_instruction
+
+            if tools:
+                function_declarations = []
+                for tool in tools:
+                    name = tool.get("name")
+                    desc = tool.get("description", "")
+                    params = tool.get("input_schema") or tool.get("parameters") or {}
+                    function_declarations.append({
+                        "name": name,
+                        "description": desc,
+                        "parameters": _clean_schema_for_gemini(copy.deepcopy(params)),
+                    })
+                payload["tools"] = [{"function_declarations": function_declarations}]
+                payload["tool_config"] = {"function_calling_config": {"mode": "ANY"}}
+
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={self._api_key}"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=PER_ROW_TIMEOUT_SECONDS) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                err_msg = error.read().decode("utf-8")
+                if error.code in (401, 403):
+                    raise AuthenticationProviderError(
+                        f"Gemini authentication failed: {err_msg}",
+                        attempts=1,
+                        category="authentication",
+                    ) from error
+                if error.code in (404, 500, 502, 503, 504):
+                    raise ModelFailureError(
+                        f"Gemini model {m} temporarily unavailable ({error.code}): {err_msg}",
+                        attempts=1,
+                        category="model",
+                    ) from error
+                if error.code == 429:
+                    time.sleep(5.0)
+                raise
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise ModelFailureError("Gemini returned no candidates", attempts=1, category="model")
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            output_blocks: list[dict[str, object]] = []
+            has_tool_call = False
+            for idx, p in enumerate(parts):
+                if "functionCall" in p:
+                    fc = p["functionCall"]
+                    has_tool_call = True
+                    output_blocks.append({
+                        "type": "tool_use",
+                        "id": f"call_{idx}_{int(time.time()*1000)%1000000}",
+                        "name": fc.get("name"),
+                        "input": fc.get("args", {}),
+                    })
+                if "text" in p and p["text"]:
+                    output_blocks.append({
+                        "type": "text",
+                        "text": p["text"],
+                    })
+
+            # Fallback parser if model emitted markdown json block instead of explicit functionCall
+            if not has_tool_call:
+                for idx, p in enumerate(parts):
+                    if "text" in p and p["text"] and "```json" in p["text"]:
+                        try:
+                            json_str = p["text"].split("```json", 1)[1].split("```", 1)[0].strip()
+                            args = json.loads(json_str)
+                            if isinstance(args, dict) and "action" in args:
+                                output_blocks.append({
+                                    "type": "tool_use",
+                                    "id": f"call_json_{idx}_{int(time.time()*1000)%1000000}",
+                                    "name": "submit_routing_decision",
+                                    "input": args,
+                                })
+                                break
+                        except Exception:
+                            pass
+
+            usage_meta = data.get("usageMetadata", {})
+            usage_obj = SimpleNamespace(
+                prompt_tokens=usage_meta.get("promptTokenCount", 0),
+                completion_tokens=usage_meta.get("candidatesTokenCount", 0),
+            )
+            return SimpleNamespace(
+                content=output_blocks,
+                usage=usage_obj,
+            )
+
+        result = retry_with_backoff(
+            request,
+            self._max_attempts,
+            self._retry_base,
+            self._retry_cap,
+            _sleep=self._sleep,
+            _random=self._random,
+        )
+        return CompletionResult(result.value, result.attempts, result.retry_count)
+
+
 ProviderResolver = Callable[[str], Provider]
 
 
@@ -986,11 +1288,18 @@ def default_provider_resolver() -> ProviderResolver:
     instances: dict[str, Provider] = {}
 
     def resolve(model: str) -> Provider:
-        provider_name = "anthropic" if model.lower().startswith("claude") else "openai"
+        provider_name = (
+            "gemini"
+            if model.lower().startswith("gemini") or (GEMINI_API_KEY and not ANTHROPIC_API_KEY)
+            else ("anthropic" if model.lower().startswith("claude") else "openai")
+        )
         if provider_name not in instances:
-            instances[provider_name] = (
-                AnthropicProvider() if provider_name == "anthropic" else OpenAIProvider()
-            )
+            if provider_name == "gemini":
+                instances[provider_name] = GeminiProvider()
+            elif provider_name == "anthropic":
+                instances[provider_name] = AnthropicProvider()
+            else:
+                instances[provider_name] = OpenAIProvider()
         return instances[provider_name]
 
     return resolve

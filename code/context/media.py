@@ -14,7 +14,7 @@ from typing import Literal
 
 from PIL import Image, ImageOps
 
-from agent.client import OpenAIProvider
+from agent.client import default_provider_resolver
 from config import CACHE_DIR, MAX_IMAGE_DIMENSION, TRANSCRIBE_MODEL
 from data.schema import MediaRef
 
@@ -172,7 +172,7 @@ def transcribe(media_ref: MediaRef, *, provider: object | None = None) -> Transc
         return cached
 
     try:
-        active_provider = provider if provider is not None else OpenAIProvider()
+        active_provider = provider if provider is not None else default_provider_resolver()(TRANSCRIBE_MODEL)
         result = active_provider.transcribe(media_ref.path, TRANSCRIBE_MODEL)
         response = getattr(result, "response", result)
         text = response if isinstance(response, str) else getattr(response, "text", None)
