@@ -12,10 +12,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 
-# Anthropic credentials are supplied by the process environment, never source control.
-ANTHROPIC_API_KEY: str | None = os.environ.get("ANTHROPIC_API_KEY")
-# OpenAI credentials are supplied by the process environment, never source control.
-OPENAI_API_KEY: str | None = os.environ.get("OPENAI_API_KEY")
+# Gemini credentials are supplied by the process environment, never source control.
+GEMINI_API_KEY: str | None = os.environ.get("GEMINI_API_KEY")
+# Anthropic and OpenAI credentials fall back to GEMINI_API_KEY when not explicitly provided.
+ANTHROPIC_API_KEY: str | None = os.environ.get("ANTHROPIC_API_KEY", GEMINI_API_KEY)
+OPENAI_API_KEY: str | None = os.environ.get("OPENAI_API_KEY", GEMINI_API_KEY)
 
 # The strongest Claude model is the production decision-maker.
 DECISION_MODEL_PRIMARY: str = "claude-opus-5"

@@ -90,9 +90,7 @@ For critical security, the system has strict automatic safety rules that cannot 
 
 ### 1. Requirements
 - Python 3.11 or newer
-- API keys for:
-  - **Anthropic** (used for understanding the message and making decisions)
-  - **OpenAI** (used for converting voice notes into text)
+- **Google Gemini API Key** (`GEMINI_API_KEY`)
 
 ### 2. Setup
 
@@ -116,7 +114,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Add Your API Keys
+### 3. Add Your API Key
 
 Create a `.env` file by copying the template:
 
@@ -124,11 +122,10 @@ Create a `.env` file by copying the template:
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and paste your keys:
+Open `.env` in any text editor and paste your Gemini API key:
 
 ```text
-ANTHROPIC_API_KEY=your-anthropic-key-here
-OPENAI_API_KEY=your-openai-key-here
+GEMINI_API_KEY=your-gemini-api-key-here
 ```
 
 ---
